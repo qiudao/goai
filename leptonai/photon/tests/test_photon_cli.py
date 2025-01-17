@@ -17,19 +17,23 @@ from leptonai import config
 from leptonai.photon import FileParam
 from leptonai.photon.base import find_local_photon
 from leptonai.cli import lep as cli
-from utils import random_name, photon_run_server, sub_test
+from leptonai.cli import photon as photon_cli
+from utils import random_name, photon_run_local_server, sub_test
 
 
 logger.info(f"Using cache dir: {config.CACHE_DIR}")
 
 
-diffusers_model = "hf:runwayml/stable-diffusion-v1-5"
-transformers_model = "hf:gpt2"
+diffusers_model = "hf:hf-internal-testing/tiny-stable-diffusion-torch@a88cdfb"
+transformers_model = "hf:sshleifer/tiny-gpt2@5f91d94"
 whisper_model = "hf:openai/whisper-tiny.en"
-wav2vec2_model = "hf:jonatasgrosman/wav2vec2-large-xlsr-53-english"
-wikihow_t5_model = "hf:facebook/bart-large-cnn"
-sentence_similarity_model = "hf:sentence-transformers/all-mpnet-base-v2"
-flan_t5_model = "hf:google/flan-t5-small"
+summarization_model = "hf:facebook/bart-large-cnn"
+sentence_similarity_model = (
+    "hf:sentence-transformers/paraphrase-albert-small-v2@b8a76dc"
+)
+text2text_generation_model = "hf:sshleifer/bart-tiny-random@69bce92"
+sentiment_analysis_model = "hf:cross-encoder/ms-marco-TinyBERT-L-2-v2"
+audio_classification_model = "hf:anton-l/wav2vec2-random-tiny-classifier"
 
 
 class TestPhotonCli(unittest.TestCase):
@@ -127,17 +131,19 @@ class TestPhotonCli(unittest.TestCase):
         [
             (diffusers_model,),
             (transformers_model,),
-            # FIXME: this model needs ffmpeg, but Github CI currently fails to
+            # FIXME: these models need ffmpeg, but Github CI currently fails to
             # install it
             # (whisper_model,),
-            (wikihow_t5_model,),
+            # (audio_classification_model,),
+            (summarization_model,),
             (sentence_similarity_model,),
-            (flan_t5_model,),
+            (text2text_generation_model,),
+            (sentiment_analysis_model,),
         ]
     )
     def test_photon_run(self, model):
         name = random_name()
-        proc, port = photon_run_server(name=name, model=model)
+        proc, port = photon_run_local_server(name=name, model=model)
 
         # test example data
         openapi = requests.get(f"http://127.0.0.1:{port}/openapi.json").json()
@@ -163,7 +169,7 @@ class TestPhotonCli(unittest.TestCase):
 
     def test_hf_embed(self):
         name = random_name()
-        proc, port = photon_run_server(name=name, model=sentence_similarity_model)
+        proc, port = photon_run_local_server(name=name, model=sentence_similarity_model)
 
         # single sentence
         res = requests.post(
@@ -212,7 +218,7 @@ class TestPhotonCli(unittest.TestCase):
         path = find_local_photon(name)
         self.assertIsNotNone(path)
 
-        proc, port = photon_run_server(path=path, model=transformers_model)
+        proc, port = photon_run_local_server(path=path, model=transformers_model)
         res = requests.post(
             f"http://127.0.0.1:{port}/run",
             json={"inputs": "a cat", "max_length": 10},
@@ -228,7 +234,7 @@ class TestPhotonCli(unittest.TestCase):
     def test_photon_run_post_file(self):
         name = random_name()
 
-        proc, port = photon_run_server(name=name, model=whisper_model)
+        proc, port = photon_run_local_server(name=name, model=whisper_model)
 
         url = "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac"
         res_post_url = requests.post(
@@ -244,6 +250,57 @@ class TestPhotonCli(unittest.TestCase):
         self.assertEqual(res_post_url.status_code, 200)
         self.assertEqual(res_post_file.status_code, 200)
         self.assertEqual(res_post_url.json(), res_post_file.json())
+
+    @unittest.skipIf(not shutil.which("ffmpeg"), "ffmpeg not installed")
+    def test_photon_run_post_multi_files(self):
+        name = random_name()
+
+        proc, port = photon_run_local_server(
+            name=name, model=audio_classification_model
+        )
+
+        url1 = "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/1.flac"
+        url2 = "https://huggingface.co/datasets/Narsil/asr_dummy/resolve/main/2.flac"
+        res_post_url = requests.post(
+            f"http://127.0.0.1:{port}/run",
+            json={"inputs": [url1, url2]},
+        )
+
+        content1 = requests.get(url1).content
+        content2 = requests.get(url2).content
+        res_post_file = requests.post(
+            f"http://127.0.0.1:{port}/run",
+            json={
+                "inputs": [
+                    {"content": FileParam.encode(content1)},
+                    {"content": FileParam.encode(content2)},
+                ]
+            },
+        )
+        proc.kill()
+        self.assertEqual(res_post_url.status_code, 200)
+        self.assertEqual(res_post_file.status_code, 200)
+        self.assertEqual(res_post_url.json(), res_post_file.json())
+
+    def test_parse_photon_token_config(self):
+        # public token
+        tokens = photon_cli._parse_deployment_tokens_or_die(True, None)
+        self.assertEqual(tokens, [])
+        tokens = photon_cli._parse_deployment_tokens_or_die(True, [])
+        self.assertEqual(tokens, [])
+        tokens = photon_cli._parse_deployment_tokens_or_die(False, None)
+        self.assertEqual(
+            tokens, [{"value_from": {"token_name_ref": "WORKSPACE_TOKEN"}}]
+        )
+        tokens = photon_cli._parse_deployment_tokens_or_die(False, ["abc", "def"])
+        self.assertEqual(
+            tokens,
+            [
+                {"value_from": {"token_name_ref": "WORKSPACE_TOKEN"}},
+                {"value": "abc"},
+                {"value": "def"},
+            ],
+        )
 
 
 if __name__ == "__main__":
